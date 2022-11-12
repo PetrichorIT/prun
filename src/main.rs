@@ -5,7 +5,7 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{atomic::*, Arc, Mutex},
     time::Instant,
 };
 use structopt::StructOpt;
@@ -26,6 +26,13 @@ struct Opt {
     )]
     num_threads: Option<usize>,
 
+    #[structopt(
+        short,
+        long,
+        help = "If set addst the last line of stdout to the output file"
+    )]
+    stdout: bool,
+
     #[structopt(short, long, parse(from_os_str), help = "Specifies the output file")]
     output: Option<PathBuf>,
 }
@@ -34,6 +41,7 @@ type Tasks = HashMap<String, Task>;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Task {
+    id: Option<usize>,
     command: String,
     args: Vec<Argument>,
 }
@@ -45,7 +53,7 @@ impl Task {
         fn p(
             args: &[Argument],
             mut so_far: Vec<String>,
-            so_far_name: String,
+            mut so_far_name: String,
             res: &mut Vec<(Vec<String>, String)>,
         ) {
             if args.is_empty() {
@@ -56,6 +64,8 @@ impl Task {
             match &args[0] {
                 Argument::Static(str) => {
                     so_far.push(str.clone());
+                    so_far_name.push(',');
+                    so_far_name.push_str(str);
                     p(&args[1..], so_far, so_far_name, res)
                 }
                 Argument::Choice(opts) => {
@@ -64,7 +74,7 @@ impl Task {
                         sf.push(opt.clone());
 
                         let mut sfn = so_far_name.clone();
-                        sfn.push(' ');
+                        sfn.push(',');
                         sfn.push_str(opt);
 
                         p(&args[1..], sf, sfn, res)
@@ -87,7 +97,7 @@ impl Task {
                             ));
 
                             let mut sfn = so_far_name.clone();
-                            sfn.push(' ');
+                            sfn.push(',');
                             sfn.push_str(&format!("{}", c));
 
                             p(&args[1..], sf, sfn, res);
@@ -110,7 +120,7 @@ impl Task {
                             ));
 
                             let mut sfn = so_far_name.clone();
-                            sfn.push(' ');
+                            sfn.push(',');
                             sfn.push_str(&format!("{}", c));
 
                             p(&args[1..], sf, sfn, res);
@@ -232,14 +242,25 @@ fn main() {
 
     println!("[PRUN] Running {} tasks on {} processes", tasks.len(), n);
 
+    let total = tasks.len();
+    let done = Arc::new(AtomicUsize::new(0));
+
     let mut handles = Vec::with_capacity(n);
     let tasks = Arc::new(Mutex::new(tasks));
 
     let verbose = opt.verbose;
+    let stdout = opt.stdout;
+
+    if !verbose {
+        print!("Progress [0/{}]", total);
+        std::io::stdout().flush().unwrap();
+    }
 
     for i in 0..n {
         let tasks = tasks.clone();
         let output = output.clone();
+        let done = done.clone();
+
         let handle = std::thread::spawn(move || {
             if verbose {
                 println!("[Worker #{}] Initalized", i);
@@ -255,9 +276,9 @@ fn main() {
                     if verbose {
                         println!("[Worker #{}] Running task: {:?}", i, name);
                     }
-                    let mut child = command.spawn().unwrap();
+                    let child = command.spawn().unwrap();
                     let t0 = Instant::now();
-                    child.wait().unwrap();
+                    let pout = child.wait_with_output().unwrap();
                     let t1 = Instant::now();
 
                     if verbose {
@@ -271,9 +292,28 @@ fn main() {
                     let output = output.lock();
                     if let Ok(mut output) = output {
                         if let Some(output) = output.as_mut() {
-                            writeln!(output, "{}: {:?}", name, t1 - t0).unwrap();
+                            if stdout {
+                                let string = String::from_utf8_lossy(&pout.stdout);
+                                let split = string.lines().last().unwrap();
+                                writeln!(
+                                    output,
+                                    "{}, {}, {}",
+                                    name,
+                                    (t1 - t0).as_secs_f64(),
+                                    split
+                                )
+                                .unwrap();
+                            } else {
+                                writeln!(output, "{}, {}", name, (t1 - t0).as_secs_f64()).unwrap();
+                            }
                             output.flush().unwrap();
                         }
+                    }
+
+                    if !verbose {
+                        let v = done.fetch_add(1, Ordering::SeqCst);
+                        print!("\rProgress [{}/{}]", v + 1, total);
+                        std::io::stdout().flush().unwrap();
                     }
                 } else {
                     break;
